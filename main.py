@@ -196,10 +196,11 @@ def answer(db, question):
     context = gen_context(data)
     return get_answer(context, question)
 
-def _exit():
+def _exit(sig, frame):
     if pg_con:
         pg_con.close()
-    print("Bye")
+    print("\nBye")
+    exit(0)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
