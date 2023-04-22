@@ -134,7 +134,10 @@ def gen_context(refs, max_token=3000):
         token_count = token_count + num_tokens_from_string(doc[0]);
         if token_count > max_token:
             break
-        context_text = "{}{}\n---\n".format(context_text, doc[0])
+        if doc[1] != "":
+            context_text = "{}{}\nSOURCE: {}\n---\n".format(context_text, doc[0], doc[1])
+        else:
+            context_text = "{}{}\n---\n".format(context_text, doc[0], doc[1])
     return context_text
 
 @retry(stop_max_attempt_number=10)
@@ -194,6 +197,7 @@ def answer(db, question):
     embedding = get_embedding(question)
     data = search_embedding(db, embedding)
     context = gen_context(data)
+    print(" > ##Context## %s"%context)
     return get_answer(context, question)
 
 def _exit(sig, frame):
