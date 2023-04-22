@@ -1,14 +1,24 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import sys
 import os
+import signal
+import re
+import time
 
 import openai
 import psycopg2
 import tiktoken
 
+from retrying import retry
+from pyrate_limiter import (Duration, RequestRate, Limiter)
+
 openai.api_key = os.getenv("OPENAI_API_KEY")
+pg_con = None
+
+rate = RequestRate(20, Duration.MINUTE)
+limiter = Limiter(rate)
 
 system_content = """
  `You are a helpful assistant. When given CONTEXT you answer questions using only that information,
@@ -62,25 +72,29 @@ def connect(db, user, password):
         sys.exit(1)
     return con
 
+@retry(stop_max_attempt_number=10)
+@limiter.ratelimit('OPENAI_API', delay=True)
 def get_embedding(text, model="text-embedding-ada-002"):
-   text = text.replace("\n", " ")
-   res = openai.Embedding.create(input = [text], model=model)
-   #print(res)
-   if res:
-       return res['data'][0]['embedding']
-   return []
+    # print("[{}] start to gen embedding".format(time.time()))
+    text = text.replace("\n", " ")
+    res = openai.Embedding.create(input = [text], model=model)
+    # print("[{}] generate embedding succ!".format(time.time()))
+    #print(res)
+    if res:
+        return res['data'][0]['embedding']
+    return []
 
 def create_embedding(db, content, url, embedding):
     sql = """INSERT INTO documents(content, url, embedding) 
              VALUES(%s, %s, %s) RETURNING id;"""
-    print(sql)
+    # print(sql)
     id = None
     if not db:
         return None 
     try:
         cur = db.cursor()
         # execute the INSERT statement
-        cur.execute(sql, (content, url, embedding))
+        cur.execute(sql, (content.replace('\x00', ''), url, embedding))
         # get the generated id back
         id = cur.fetchone()[0]
         # commit the changes to the database
@@ -113,7 +127,7 @@ def search_embedding(db, embedding, limit=10):
         print(error)
     return data
 
-def gen_context(refs, max_token=1500):
+def gen_context(refs, max_token=3000):
     context_text = ""
     token_count = 0
     for doc in refs:
@@ -123,6 +137,8 @@ def gen_context(refs, max_token=1500):
         context_text = "{}{}\n---\n".format(context_text, doc[0])
     return context_text
 
+@retry(stop_max_attempt_number=10)
+@limiter.ratelimit('OPENAI_API', delay=True)
 def get_answer(context, question):
     messages=[
         {"role": "system", "content": system_content},
@@ -134,28 +150,80 @@ def get_answer(context, question):
     ret = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=messages)
     return ret['choices'][0]['message']['content']
 
-if __name__ == "__main__":
-    con = connect(db="postgres", user="root", password="root123")
-    text = '''
-    In all-stop mode, whenever your program stops under GDB for any reason, all threads of execution stop, not just the current thread. This allows you to examine the overall state of the program, including switching between threads, without worrying that things may change underfoot.
+def gen_verctor_from_file(db, filepath, chunk_size=2000):
+    chunk_content = ""
+    content_size = 0
+    total_size = 0
+    call_api_cnt = 0
+    for line in open(filepath):
+        str = re.sub(r'\s+', ' ', line.strip())
+        size = num_tokens_from_string(str)
+        total_size += size
+        if content_size + size < chunk_size:
+            content_size += size
+            chunk_content += str
+            continue
 
-Conversely, whenever you restart the program, all threads start executing. This is true even when single-stepping with commands like step or next.
+        # generate embedding
+        # print(chunk_content)
+        call_api_cnt += 1
+        embedding = get_embedding(chunk_content)
+        if len(embedding) == 0:
+            print("empty embedding!")
+            return
 
-In particular, GDB cannot single-step all threads in lockstep. Since thread scheduling is up to your debugging target’s operating system (not controlled by GDB), other threads may execute more than one statement while the current thread completes a single step. Moreover, in general other threads stop in the middle of a statement, rather than at a clean statement boundary, when the program stops.
+        id = create_embedding(db, chunk_content, "", embedding)
+        if not id:
+          print("failed to create embedding")
+          return 
+        content_size = size
+        chunk_content = str
+        # sleep 300ms
+    if content_size > 0:
+        call_api_cnt += 1
+        #generate embedding
+        #print(chunk_content)
+        embedding = get_embedding(chunk_content)
+        id = create_embedding(db, chunk_content, "", embedding)
+        if not id:
+            print("failed to create embedding")
+            return 
+    print("total token cost: %d\n call api count: %d"%(total_size, call_api_cnt))
 
-You might even find your program stopped in another thread after continuing or even single-stepping. This happens whenever some other thread runs into a breakpoint, a signal, or an exception before the first thread completes whatever you requested.
-
-Whenever GDB stops your program, due to a breakpoint or a signal, it automatically selects the thread where that breakpoint or signal happened. GDB alerts you to the context switch with a message such as ‘[Switching to Thread n]’ to identify the thread.
-'''
-    embedding = get_embedding(text)
-    #print(embedding)
-    #id = create_embedding(con, text, "", embedding)
-    #print(id)
-    data = search_embedding(con, embedding)
-    #print(data)
+def answer(db, question):
+    embedding = get_embedding(question)
+    data = search_embedding(db, embedding)
     context = gen_context(data)
-    #print(context)
-    ans = get_answer(context, "what is gdb all-stop mode")
-    print(ans)
+    return get_answer(context, question)
 
-    con.close()
+def _exit():
+    if pg_con:
+        pg_con.close()
+    print("Bye")
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: ./doc_gpt gen file_path or ./doc_gpt chat")
+        exit(1)
+    
+    signal.signal(signal.SIGINT, _exit)
+    signal.signal(signal.SIGTERM, _exit)
+
+    cmd = sys.argv[1]
+    if cmd == "gen":
+        if len(sys.argv) < 3:
+            print("Usage: ./doc_gpt gen file_path")
+            exit(1)
+        filepath = sys.argv[2]
+        if not os.path.exists(filepath):
+            print("file [%s] not exist"%filepath)
+            exit(1)
+        pg_con = connect(db="postgres", user="root", password="root123")
+        gen_verctor_from_file(pg_con, filepath)
+        pg_con.close()
+    elif cmd == "chat":
+        pg_con = connect(db="postgres", user="root", password="root123")
+        while True:
+            q = input("Q# ")
+            ans = answer(pg_con, q)
+            print("A# %s"%ans)
