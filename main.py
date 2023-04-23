@@ -63,10 +63,10 @@ def num_tokens_from_string(string, encoding_name="cl100k_base"):
     num_tokens = len(encoding.encode(string))
     return num_tokens
 
-def connect(db, user, password):
+def connect(db, host, user, password):
     con = None
     try:
-        con = psycopg2.connect(database=db, user=user, password=password)
+        con = psycopg2.connect(database=db, host=host, user=user, password=password)
     except psycopg2.DatabaseError as e:
         print(f'Error {e}')
         sys.exit(1)
@@ -223,11 +223,11 @@ if __name__ == "__main__":
         if not os.path.exists(filepath):
             print("file [%s] not exist"%filepath)
             exit(1)
-        pg_con = connect(db="postgres", user="root", password="root123")
+        pg_con = connect(db="postgres", host="127.0.0.1", user="root", password="root123")
         gen_verctor_from_file(pg_con, filepath)
         pg_con.close()
     elif cmd == "chat":
-        pg_con = connect(db="postgres", user="root", password="root123")
+        pg_con = connect(db="postgres", host="127.0.0.1", user="root", password="root123")
         while True:
             q = input("Q# ")
             ans = answer(pg_con, q)
