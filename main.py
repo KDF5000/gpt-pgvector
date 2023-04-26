@@ -6,6 +6,7 @@ import os
 import signal
 import re
 import time
+import json
 
 import openai
 import psycopg2
@@ -26,7 +27,7 @@ system_content = """
   is not explicitly written in the CONTEXT provided, you say "Sorry, I don't know how to help with that."  If the CONTEXT includes
   source URLs include them under a SOURCES heading at the end of your response. Always include all of the relevant source urls
   from the CONTEXT, but never list a URL more than once (ignore trailing forward slashes when comparing for uniqueness).
-  Never include URLs that are not in the CONTEXT sections. Never make up URLs`;
+  Never include URLs that are not in the CONTEXT sections. Never make up URLs`
 """
 
 user_content = """CONTEXT:
@@ -105,11 +106,12 @@ def create_embedding(db, content, url, embedding):
         print(error)
     return id
 
-def search_embedding(db, embedding, limit=10):
+def search_embedding(db, embedding, limit=10, similarity_threshold=0.1):
     # <-> : L2 distance
     # <#> : inner product, returns the negative inner product since Postgres only supports ASC order index scans on operators
     # <=> : cosine distance
-    sql = "SELECT content, url FROM documents ORDER BY embedding <-> '{}' LIMIT {};".format(embedding, limit)
+    #sql = "SELECT content, url FROM documents ORDER BY embedding <-> '{}' LIMIT {};".format(embedding, limit)
+    sql = "SELECT * FROM match_documents('{}', {}, {});".format(embedding, similarity_threshold, limit)
     data = []
     try:
         cur = db.cursor()
@@ -128,16 +130,19 @@ def search_embedding(db, embedding, limit=10):
     return data
 
 def gen_context(refs, max_token=3000):
+    if refs == None or len(refs) == 0:
+        return None
+
     context_text = ""
     token_count = 0
     for doc in refs:
-        token_count = token_count + num_tokens_from_string(doc[0]);
+        token_count = token_count + num_tokens_from_string(doc[1]);
         if token_count > max_token:
             break
-        if doc[1] != "":
-            context_text = "{}{}\nSOURCE: {}\n---\n".format(context_text, doc[0], doc[1])
+        if doc[2] != "":
+            context_text = "{}{}\nSOURCE: {}\n---\n".format(context_text, doc[1], doc[2])
         else:
-            context_text = "{}{}\n---\n".format(context_text, doc[0], doc[1])
+            context_text = "{}{}\n---\n".format(context_text, doc[1])
     return context_text
 
 @retry(stop_max_attempt_number=10)
@@ -150,10 +155,11 @@ def get_answer(context, question):
         {"role": "user", "content": user_message.format(context, question)}
     ]
 
+    #print(json.dumps(messages))
     ret = openai.ChatCompletion.create(model="gpt-3.5-turbo", messages=messages)
     return ret['choices'][0]['message']['content']
 
-def gen_verctor_from_file(db, filepath, chunk_size=2000):
+def gen_vector_from_file(db, filepath, chunk_size=2000):
     chunk_content = ""
     content_size = 0
     total_size = 0
@@ -224,7 +230,7 @@ if __name__ == "__main__":
             print("file [%s] not exist"%filepath)
             exit(1)
         pg_con = connect(db="postgres", host="127.0.0.1", user="root", password="root123")
-        gen_verctor_from_file(pg_con, filepath)
+        gen_vector_from_file(pg_con, filepath)
         pg_con.close()
     elif cmd == "chat":
         pg_con = connect(db="postgres", host="127.0.0.1", user="root", password="root123")
